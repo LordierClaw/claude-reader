@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 from textual.widgets import Static
 
 from ccreader.fakes import ToolCall
+from ccreader.scheduler import CHOICE, COMPACT, PERMISSION, Interaction
 from ccreader.render import (
     BULLET,
     CLAUDE_ORANGE,
@@ -137,10 +137,17 @@ class ToolBlock(Static):
         self.done = done
         self.shown = len(call.body) if done else 0
         self.interrupted = False
+        self.rejected = ""
 
     def finish(self) -> None:
         self.done = True
         self.shown = len(self.call.body)
+        self.refresh(layout=True)
+
+    def reject(self, message: str) -> None:
+        self.done = True
+        self.shown = 0
+        self.rejected = message
         self.refresh(layout=True)
 
     def show_lines(self, n: int) -> None:
@@ -156,6 +163,9 @@ class ToolBlock(Static):
         head.append(c.name, style="dim bold")
         head.append(f"({c.arg})", style=NOISE)
         lines: list[Text] = [_line(head)]
+        if self.rejected:
+            lines.append(_line(Text(f" {ELBOW}{self.rejected}", style=NOISE)))
+            return Group(*lines)
         if self.done and c.summary:
             lines.append(_line(Text(f" {ELBOW}{c.summary}", style=NOISE)))
         for raw in c.body[: self.shown]:
@@ -176,8 +186,8 @@ class ToolBlock(Static):
 class NoteLine(Static):
     DEFAULT_CSS = "NoteLine { margin-top: 1; }"
 
-    def __init__(self, text: Text | str, *, margin: bool = True) -> None:
-        super().__init__(text if isinstance(text, Text) else Text(text, style=NOISE))
+    def __init__(self, text: RenderableType, *, margin: bool = True) -> None:
+        super().__init__(Text(text, style=NOISE) if isinstance(text, str) else text)
         if not margin:
             self.styles.margin = (0, 0, 0, 0)
 
@@ -204,6 +214,12 @@ class Spinner(Static):
         self.tokens = 0
         self.frame = 0
         self.active = False
+        self.display = False
+
+    def set_active(self, active: bool) -> None:
+        self.active = active
+        self.display = active
+        self.refresh()
 
     def render(self) -> RenderableType:
         if not self.active:
@@ -279,10 +295,74 @@ class StatusBar(Static):
         return _line(left)
 
 
-def interaction_table(rows: list[tuple[str, str]]) -> Table:
-    grid = Table.grid(padding=(0, 1))
-    grid.add_column()
-    grid.add_column()
-    for a, b in rows:
-        grid.add_row(a, b)
-    return grid
+class InteractionPanel(Static):
+    """Permission prompt / multiple-choice question / compact confirmation."""
+
+    DEFAULT_CSS = "InteractionPanel { height: auto; margin-top: 1; padding: 0 1 0 1; }"
+
+    def __init__(self, accent: str = CLAUDE_ORANGE) -> None:
+        super().__init__()
+        self.accent = accent
+        self.interaction: Interaction | None = None
+        self.selected = 0
+        self.display = False
+
+    def show(self, interaction: Interaction) -> None:
+        self.interaction = interaction
+        self.selected = 0
+        self.display = True
+        self.refresh(layout=True)
+
+    def hide(self) -> None:
+        self.interaction = None
+        self.display = False
+
+    def move(self, delta: int) -> None:
+        if self.interaction:
+            self.selected = (self.selected + delta) % len(self.interaction.options)
+            self.refresh()
+
+    def _options(self) -> list[Text]:
+        it = self.interaction
+        out: list[Text] = []
+        for i, option in enumerate(it.options):
+            chosen = i == self.selected
+            line = Text()
+            line.append("❯ " if chosen else "  ", style=self.accent)
+            line.append(f"{i + 1}. {option}", style=self.accent if chosen else "")
+            out.append(line)
+            if it.descriptions and i < len(it.descriptions):
+                out.append(Text(f"     {it.descriptions[i]}", style=NOISE))
+        return out
+
+    def render(self) -> RenderableType:
+        it = self.interaction
+        if it is None:
+            return Text("")
+        if it.kind == PERMISSION:
+            preview: list[Text] = []
+            call = it.call
+            if call is not None and call.name == "Update":
+                preview.append(Text(call.arg, style="bold"))
+                for raw in call.body[:14]:
+                    style = "green" if raw[5:6] == "+" else "red" if raw[5:6] == "-" else NOISE
+                    preview.append(_line(Text(raw, style=style)))
+            elif call is not None:
+                preview.append(Text(f"  {call.arg}"))
+                preview.append(Text("  Run the test suite", style=NOISE))
+            inner = Panel(Group(*preview), border_style="dim", padding=(0, 1))
+            body = Group(Text(it.title, style=f"bold {self.accent}"), inner,
+                         Text(it.question), *self._options())
+            return Panel(body, border_style=self.accent, padding=(0, 1))
+        if it.kind == CHOICE:
+            head = Text()
+            head.append("☐ ", style=NOISE)
+            head.append(it.title, style="bold")
+            hint = Text("Enter to select · ↑/↓ to navigate · Esc to cancel", style=NOISE)
+            return Group(head, Text(""), Text(it.question, style="bold"), *self._options(),
+                         Text(""), hint)
+        if it.kind == COMPACT:
+            head = Text(f"⚠ {it.title}", style="yellow")
+            return Panel(Group(head, Text(it.question), *self._options()),
+                         border_style="dim", padding=(0, 1))
+        return Text("")

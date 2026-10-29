@@ -11,12 +11,22 @@ from rich.text import Text
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
-from textual.widgets import Static
 
 from ccreader.fakes import ToolCall
+from ccreader.render import hanging
+from ccreader.scheduler import (
+    CHOICE,
+    COMPACT,
+    PERMISSION,
+    TYPEOUT,
+    Interaction,
+    TypeOut,
+    build_interaction,
+)
 from ccreader.screens import BaseScreen
 from ccreader.turns import AgentText, Novel, Pause, Thinking
 from ccreader.widgets import (
+    InteractionPanel,
     NoteLine,
     NovelBlock,
     PromptBar,
@@ -42,7 +52,6 @@ class MainScreen(BaseScreen):
     DEFAULT_CSS = """
     MainScreen { background: ansi_default; }
     #log { height: 1fr; scrollbar-size-vertical: 1; }
-    #interaction { height: auto; display: none; }
     """
 
     def __init__(self) -> None:
@@ -55,6 +64,8 @@ class MainScreen(BaseScreen):
         self.current_block: NovelBlock | None = None
         self._skip = asyncio.Event()
         self._submit: asyncio.Future[str] | None = None
+        self._answer: asyncio.Future[int] | None = None
+        self.typeout: TypeOut | None = None
         self._ctrl_c = 0.0
 
     # -- layout ------------------------------------------------------------
@@ -64,7 +75,7 @@ class MainScreen(BaseScreen):
         log.can_focus = False
         yield log
         yield Spinner()
-        yield Static(id="interaction")
+        yield InteractionPanel()
         yield PromptBar()
         yield StatusBar()
 
@@ -134,12 +145,11 @@ class MainScreen(BaseScreen):
     def set_busy(self, busy: bool) -> None:
         self.busy = busy
         spinner = self.query_one(Spinner)
-        spinner.active = busy
         if busy:
             self.turn_started = monotonic()
             self.turn_tokens = 0
             spinner.verb = self.rng.choice(VERBS)
-        spinner.refresh()
+        spinner.set_active(busy)
 
     async def wait(self, seconds: float) -> None:
         """Sleep, unless Space cuts it short."""
@@ -168,7 +178,10 @@ class MainScreen(BaseScreen):
                 await self.append(NoteLine(agent_text("All tasks are complete.")))
                 await asyncio.Event().wait()
             app.set_position(turn.end)
-            await self.wait_for_user()
+            if app.scheduler.due():
+                await self.interact(TYPEOUT, CHOICE, COMPACT, PERMISSION)
+            else:
+                await self.wait_for_user()
 
     async def play(self, event) -> None:
         app = self.app
@@ -194,6 +207,8 @@ class MainScreen(BaseScreen):
     async def play_novel(self, event: Novel) -> None:
         app = self.app
         if not event.title:
+            if app.scheduler.due():
+                await self.interact(PERMISSION, CHOICE, COMPACT)
             app.set_position((event.chapter, event.para))
         block = NovelBlock(event.text, chapter=event.chapter, para=event.para,
                            turn=self.turn_no, bullet=event.bullet, title=event.title,
@@ -253,6 +268,85 @@ class MainScreen(BaseScreen):
         block.reveal(len(block.text))
         self._skip.clear()
 
+    # -- interactions ------------------------------------------------------
+
+    async def interact(self, *allowed: str) -> None:
+        """Block on one interaction of an allowed kind, then reschedule."""
+        app = self.app
+        kind = app.scheduler.pick_kind(allowed)
+        interaction = build_interaction(kind, app.corpus, self.rng)
+        spinner = self.query_one(Spinner)
+        was_active = spinner.active
+        spinner.set_active(False)
+        try:
+            if kind == TYPEOUT:
+                await self.run_typeout(interaction)
+            elif kind == PERMISSION:
+                await self.run_permission(interaction)
+            elif kind == CHOICE:
+                index = await self.ask(interaction)
+                answer = f"· {interaction.question} → {interaction.options[index]}"
+                await self.append(NoteLine(agent_text("User answered Claude's questions:")),
+                                  NoteLine(hanging(Text("   ⎿  ", style="dim"),
+                                                   Text(answer, style="dim")), margin=False))
+            elif kind == COMPACT:
+                if await self.ask(interaction) == 0:
+                    await self.compact()
+        finally:
+            app.scheduler.reset()
+            if self.is_attached:
+                spinner.set_active(was_active)
+
+    async def ask(self, interaction: Interaction) -> int:
+        panel = self.query_one(InteractionPanel)
+        prompt = self.query_one(PromptBar)
+        self._answer = asyncio.get_running_loop().create_future()
+        panel.show(interaction)
+        prompt.display = False
+        try:
+            return await self._answer
+        finally:
+            self._answer = None
+            if self.is_attached:
+                panel.hide()
+                prompt.display = True
+
+    def answer(self, index: int) -> None:
+        if self._answer is not None and not self._answer.done():
+            self._answer.set_result(index)
+
+    async def run_permission(self, interaction: Interaction) -> None:
+        call = interaction.call
+        block = ToolBlock(call, done=False)
+        await self.append(block)
+        if await self.ask(interaction) == interaction.cancel_index:
+            what = "update to " + call.arg if call.name == "Update" else "bash command"
+            block.reject(f"User rejected {what}")
+            # "tell Claude what to do differently"
+            await self.run_typeout(build_interaction(TYPEOUT, self.app.corpus, self.rng))
+        else:
+            block.finish()
+            self.add_tokens(call.tokens)
+
+    async def run_typeout(self, interaction: Interaction) -> None:
+        self.typeout = TypeOut(interaction.canned)
+        try:
+            await self.wait_for_user()
+        finally:
+            self.typeout = None
+
+    async def compact(self) -> None:
+        spinner = self.query_one(Spinner)
+        spinner.verb = "Compacting conversation"
+        spinner.set_active(True)
+        self.turn_started = monotonic()
+        await asyncio.sleep(self.rng.uniform(1.5, 3.5))
+        spinner.set_active(False)
+        self.app.tokens = self.rng.randint(4_000, 9_000)
+        self.update_status()
+        await self.append(NoteLine(Text(" ✻ Conversation compacted (ctrl+o for history)",
+                                        style="dim")))
+
     # -- user input --------------------------------------------------------
 
     async def wait_for_user(self) -> str:
@@ -266,6 +360,10 @@ class MainScreen(BaseScreen):
     async def submit(self) -> None:
         prompt = self.query_one(PromptBar)
         text = prompt.buffer.strip()
+        if self.typeout is not None:
+            if not self.typeout.shown:
+                return  # a typed-out prompt needs at least one keystroke
+            text = self.typeout.finish()
         prompt.set_buffer("")
         if text.startswith("/"):
             await self.slash_command(text)
@@ -309,6 +407,16 @@ class MainScreen(BaseScreen):
             self.log_view.scroll_page_up(animate=False)
         elif key == "pagedown":
             self.log_view.scroll_page_down(animate=False)
+        elif self._answer is not None:
+            self.interaction_key(key, char)
+        elif self.typeout is not None and key == "backspace":
+            prompt.set_buffer(self.typeout.backspace())
+        elif self.typeout is not None and char and char.isprintable():
+            if char == "/" and not self.typeout.shown:
+                self.typeout = None  # typing a command: switch to literal input
+                prompt.set_buffer("/")
+            else:
+                prompt.set_buffer(self.typeout.key())
         elif key == "enter":
             await self.submit()
         elif key == "backspace":
@@ -317,6 +425,27 @@ class MainScreen(BaseScreen):
             if not prompt.buffer and self.on_control_char(char):
                 return
             prompt.set_buffer(prompt.buffer + char)
+
+    def interaction_key(self, key: str, char: str | None) -> None:
+        panel = self.query_one(InteractionPanel)
+        if panel.interaction is None:
+            return
+        if key in ("up", "k"):
+            panel.move(-1)
+        elif key in ("down", "j", "tab"):
+            panel.move(1)
+        elif key == "enter":
+            self.answer(panel.selected)
+        elif char and char.isdigit() and 1 <= int(char) <= len(panel.interaction.options):
+            self.answer(int(char) - 1)
+
+    def on_single_escape(self) -> None:
+        panel = self.query_one(InteractionPanel)
+        if self._answer is not None and panel.interaction is not None:
+            if panel.interaction.cancel_index is not None:
+                self.answer(panel.interaction.cancel_index)
+        else:
+            self.query_one(PromptBar).set_buffer("")
 
     def on_control_char(self, char: str) -> bool:
         """Single-key controls, active while the prompt is empty."""

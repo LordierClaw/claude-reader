@@ -70,3 +70,31 @@ async def test_wpm_keys(sample_txt):
     async with app.run_test(size=(100, 40)) as pilot:
         await pilot.press("plus", "plus", "minus")
         assert app.wpm == 275
+
+
+async def test_interactions_block_until_answered(sample_txt):
+    from ccreader.widgets import InteractionPanel
+
+    clock = [0.0]
+    store = Store()
+    book = store.open_book(sample_txt)
+    app = ReaderApp(book, store, Config(wpm=2000, stream_mode="instant").normalized(),
+                    start=(1, 0), rng=random.Random(2), clock=lambda: clock[0])
+    async with app.run_test(size=(100, 40)) as pilot:
+        clock[0] = 10**6
+        panel = app.main.query_one(InteractionPanel)
+        for _ in range(60):
+            await pilot.pause(0.05)
+            if panel.interaction or app.main.typeout:
+                break
+            await pilot.press("space")
+        assert panel.interaction or app.main.typeout
+        mark = app.position
+        await pilot.pause(0.5)
+        assert app.position == mark  # nothing advances while waiting
+        if panel.interaction:
+            await pilot.press("1")
+        else:
+            await pilot.press("x", "enter")
+        await pilot.pause(0.1)
+        assert panel.interaction is None and app.main.typeout is None

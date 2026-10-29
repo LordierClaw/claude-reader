@@ -9,6 +9,7 @@ from textual.app import App
 from ccreader.book import Book
 from ccreader.config import Config
 from ccreader.noise import NoiseCorpus, builtin_corpus
+from ccreader.scheduler import InteractionScheduler
 from ccreader.state import Store
 from ccreader.transcript import TranscriptScreen
 from ccreader.turns import TurnBuilder
@@ -20,7 +21,8 @@ class ReaderApp(App, inherit_bindings=False):
 
     def __init__(self, book: Book, store: Store, config: Config,
                  corpus: NoiseCorpus | None = None, start: tuple[int, int] | None = None,
-                 transcript_only: bool = False, rng: random.Random | None = None) -> None:
+                 transcript_only: bool = False, rng: random.Random | None = None,
+                 clock=None) -> None:
         super().__init__(ansi_color=True)
         self.book = book
         self.store = store
@@ -34,6 +36,10 @@ class ReaderApp(App, inherit_bindings=False):
         self.stream_mode = config.stream_mode
         self.tokens = self.rng.randint(9_000, 22_000)
         self.builder = TurnBuilder(book, self.corpus, self.rng, config.paragraphs_per_turn)
+        sched_args = {"clock": clock} if clock else {}
+        self.scheduler = InteractionScheduler(config.interaction_min_minutes,
+                                              config.interaction_max_minutes, self.rng,
+                                              **sched_args)
 
     def on_mount(self) -> None:
         self.theme = "ansi-light" if self.config.theme == "light" else "ansi-dark"
