@@ -14,6 +14,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ccreader", description="Terminal novel reader.")
     p.add_argument("book", nargs="?", help=".txt or .epub file (default: last opened book)")
     p.add_argument("--chapter", type=int, help="start at chapter N (1-based)")
+    p.add_argument("--repo", help="work repo used to build the noise corpus")
+    p.add_argument("--rescan", action="store_true", help="rescan the repo for the noise corpus")
+    p.add_argument("--transcript", action="store_true", help="open the plain transcript view only")
     p.add_argument("--list-chapters", action="store_true", help="print chapters and exit")
     p.add_argument("--version", action="version", version=f"ccreader {__version__}")
     return p
@@ -41,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
         start = book.clamp(args.chapter - 1, 0)
 
     from ccreader.app import ReaderApp
+    from ccreader.noise import load_corpus
 
-    ReaderApp(book, store, config, start=start).run()
+    corpus = load_corpus(args.repo or config.repo, store, rescan=args.rescan)
+    ReaderApp(book, store, config, corpus=corpus, start=start,
+              transcript_only=args.transcript).run()
     return 0
