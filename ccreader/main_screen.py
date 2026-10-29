@@ -12,6 +12,7 @@ from textual import events
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 
+from ccreader.boss import BOSS_PROMPTS, build_boss_sequence
 from ccreader.fakes import ToolCall
 from ccreader.render import hanging
 from ccreader.scheduler import (
@@ -66,6 +67,8 @@ class MainScreen(BaseScreen):
         self._submit: asyncio.Future[str] | None = None
         self._answer: asyncio.Future[int] | None = None
         self.typeout: TypeOut | None = None
+        self.bossed = False
+        self._boss_block: ToolBlock | None = None
         self._ctrl_c = 0.0
 
     # -- layout ------------------------------------------------------------
@@ -172,7 +175,7 @@ class MainScreen(BaseScreen):
                 for event in turn.events:
                     await self.play(event)
             finally:
-                if self.is_attached:
+                if self.is_attached and not self.bossed:
                     self.set_busy(False)
             if turn.end is None:
                 await self.append(NoteLine(agent_text("All tasks are complete.")))
@@ -300,16 +303,17 @@ class MainScreen(BaseScreen):
     async def ask(self, interaction: Interaction) -> int:
         panel = self.query_one(InteractionPanel)
         prompt = self.query_one(PromptBar)
-        self._answer = asyncio.get_running_loop().create_future()
+        future = self._answer = asyncio.get_running_loop().create_future()
         panel.show(interaction)
         prompt.display = False
         try:
-            return await self._answer
+            return await future
         finally:
-            self._answer = None
-            if self.is_attached:
-                panel.hide()
-                prompt.display = True
+            if self._answer is future:
+                self._answer = None
+                if self.is_attached:
+                    panel.hide()
+                    prompt.display = True
 
     def answer(self, index: int) -> None:
         if self._answer is not None and not self._answer.done():
@@ -329,11 +333,12 @@ class MainScreen(BaseScreen):
             self.add_tokens(call.tokens)
 
     async def run_typeout(self, interaction: Interaction) -> None:
-        self.typeout = TypeOut(interaction.canned)
+        typeout = self.typeout = TypeOut(interaction.canned)
         try:
             await self.wait_for_user()
         finally:
-            self.typeout = None
+            if self.typeout is typeout:
+                self.typeout = None
 
     async def compact(self) -> None:
         spinner = self.query_one(Spinner)
@@ -347,15 +352,85 @@ class MainScreen(BaseScreen):
         await self.append(NoteLine(Text(" ✻ Conversation compacted (ctrl+o for history)",
                                         style="dim")))
 
+    # -- boss key ----------------------------------------------------------
+
+    def boss(self) -> None:
+        """Hide the novel: collapse it and push a burst of work output over it."""
+        if self.bossed:
+            return
+        self.bossed = True
+        interrupted = self.busy
+        self.workers.cancel_group(self, "player")
+        self._drop_pending()
+        self.collapse_novel()
+        self.run_worker(self.boss_sequence(interrupted=interrupted), group="boss",
+                        exclusive=True)
+
+    def resume(self) -> None:
+        if not self.bossed:
+            return
+        self.bossed = False
+        self.workers.cancel_group(self, "boss")
+        if self._boss_block is not None and not self._boss_block.done:
+            self._boss_block.reject("Interrupted by user")
+        self._boss_block = None
+        self._drop_pending()
+        self.set_busy(False)
+        self.start_player(resumed=True)
+
+    def _drop_pending(self) -> None:
+        for future in (self._answer, self._submit):
+            if future is not None and not future.done():
+                future.cancel()
+        self._answer = self._submit = None
+        self.typeout = None
+        self.query_one(InteractionPanel).hide()
+        prompt = self.query_one(PromptBar)
+        prompt.display = True
+        prompt.set_buffer("")
+
+    async def boss_sequence(self, interrupted: bool, request: str | None = None) -> None:
+        if interrupted:
+            await self.append(NoteLine(Text("   ⎿  Interrupted by user", style="dim"),
+                                       margin=False))
+        else:
+            await self.append(NoteLine(user_text(request or self.rng.choice(BOSS_PROMPTS))))
+        steps, prompt = build_boss_sequence(self.app.corpus, self.rng)
+        self.set_busy(True)
+        try:
+            for step in steps:
+                if isinstance(step, AgentText):
+                    await self.append(NoteLine(agent_text(step.text)))
+                    await asyncio.sleep(0.03)
+                    continue
+                block = ToolBlock(step, done=False)
+                await self.append(block)
+                await asyncio.sleep(0.05)
+                for n in range(0, len(step.body) + 1, 2):
+                    block.show_lines(n)
+                    await asyncio.sleep(1 / 60)
+                block.finish()
+                self.add_tokens(step.tokens)
+        finally:
+            if self.is_attached and self.bossed:
+                self.set_busy(False)
+        call = prompt.call
+        block = self._boss_block = ToolBlock(call, done=False)
+        await self.append(block)
+        if await self.ask(prompt) == prompt.cancel_index:
+            block.reject(f"User rejected update to {call.arg}")
+        else:
+            block.finish()
+
     # -- user input --------------------------------------------------------
 
     async def wait_for_user(self) -> str:
-        loop = asyncio.get_running_loop()
-        self._submit = loop.create_future()
+        future = self._submit = asyncio.get_running_loop().create_future()
         try:
-            return await self._submit
+            return await future
         finally:
-            self._submit = None
+            if self._submit is future:
+                self._submit = None
 
     async def submit(self) -> None:
         prompt = self.query_one(PromptBar)
@@ -365,6 +440,16 @@ class MainScreen(BaseScreen):
                 return  # a typed-out prompt needs at least one keystroke
             text = self.typeout.finish()
         prompt.set_buffer("")
+        if self.bossed:
+            if text.lower() in ("continue", "/resume", "resume"):
+                await self.append(NoteLine(user_text(text)))
+                self.resume()
+            elif text.startswith("/"):
+                await self.slash_command(text)
+            elif text:
+                self.run_worker(self.boss_sequence(interrupted=False, request=text),
+                                group="boss", exclusive=True)
+            return
         if text.startswith("/"):
             await self.slash_command(text)
             return

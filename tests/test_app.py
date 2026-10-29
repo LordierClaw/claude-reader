@@ -98,3 +98,70 @@ async def test_interactions_block_until_answered(sample_txt):
             await pilot.press("x", "enter")
         await pilot.pause(0.1)
         assert panel.interaction is None and app.main.typeout is None
+
+
+def visible_novel(screen):
+    return [b for b in screen.query(NovelBlock) if not b.collapsed and b.display]
+
+
+async def test_boss_key_collapses_pushes_and_resumes(sample_txt):
+    from ccreader.widgets import InteractionPanel
+
+    app = make_app(sample_txt)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await advance(pilot, 10)
+        screen = app.main
+        assert visible_novel(screen)
+        await pilot.press("escape", "escape")
+        await pilot.pause(0.05)
+        assert screen.bossed
+        assert not visible_novel(screen)  # collapsed immediately
+        panel = screen.query_one(InteractionPanel)
+        for _ in range(60):
+            await pilot.pause(0.05)
+            if panel.interaction:
+                break
+        assert panel.interaction is not None  # ends on a permission prompt
+        assert panel.interaction.kind == "permission"
+        log = screen.log_view
+        assert log.max_scroll_y > 0 and log.scroll_y == log.max_scroll_y
+        # typing "continue" resumes
+        await pilot.press("escape")
+        await pilot.pause(0.6)  # single Esc answers "No"
+        await pilot.press(*"continue", "enter")
+        await pilot.pause(0.1)
+        assert not screen.bossed
+        await advance(pilot, 10)
+        assert visible_novel(screen)
+        # Esc Esc again from the transcript view
+        await pilot.press("ctrl+o")
+        await pilot.pause(0.1)
+        await pilot.press("escape", "escape")
+        await pilot.pause(0.1)
+        assert app.screen is screen and screen.bossed
+        await pilot.press("escape", "escape")
+        await pilot.pause(0.1)
+        assert not screen.bossed
+
+
+async def test_ctrl_backslash_quits(sample_txt):
+    app = make_app(sample_txt)
+    calls = []
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.press("ctrl+o")
+        original = app.exit
+        app.exit = lambda *a, **k: (calls.append(1), original(*a, **k))
+        await pilot.press("ctrl+backslash")
+        await pilot.pause(0.1)
+    assert calls
+
+
+async def test_focus_loss_triggers_boss(sample_txt):
+    from textual import events
+
+    app = make_app(sample_txt)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await advance(pilot, 3)
+        app.post_message(events.AppBlur())
+        await pilot.pause(0.1)
+        assert app.main.bossed

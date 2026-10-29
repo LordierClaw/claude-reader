@@ -74,8 +74,28 @@ class ReaderApp(App, inherit_bindings=False):
         self.push_screen(TranscriptScreen(self.book, chapter, para, self.config.max_width))
 
     def boss_key(self) -> None:
-        if isinstance(self.screen, TranscriptScreen) and not self.transcript_only:
-            self.pop_screen()
+        """Esc Esc: hide the novel (from any view), or resume when already hidden."""
+        if self.transcript_only:
+            self.exit()
+            return
+        main = self.main
+        if main is None:
+            return
+        if self.screen is not main:
+            while self.screen is not main:
+                self.pop_screen()
+            main.boss()
+        elif main.bossed:
+            main.resume()
+        else:
+            main.boss()
+
+    def on_app_blur(self) -> None:
+        main = self.main
+        if self.config.boss_on_blur and main is not None and not main.bossed:
+            while self.screen is not main:
+                self.pop_screen()
+            main.boss()
 
     def panic_quit(self) -> None:
         self.exit()

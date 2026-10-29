@@ -66,9 +66,9 @@ def bash_short_call(c: NoiseCorpus, rng: random.Random) -> ToolCall:
         files = rng.sample(c.paths, k=min(len(c.paths), 3))
         body = [f"{p}:{rng.randint(10, 300)}:    {sym}" for p in files]
         return ToolCall("Bash", f'rg -n "{sym}" | head -5', body[0], body[1:], tokens=260)
-    line = rng.choice(c.commits)
-    return ToolCall("Bash", "git log --oneline -3", line,
-                    [rng.choice(c.commits) for _ in range(2)], tokens=140)
+    start = rng.randrange(max(1, len(c.commits) - 2))
+    lines = c.commits[start:start + 3]
+    return ToolCall("Bash", "git log --oneline -3", lines[0], lines[1:], tokens=140)
 
 
 def light_call(c: NoiseCorpus, rng: random.Random) -> ToolCall:
