@@ -44,6 +44,26 @@ VERBS = ["Thinking", "Pondering", "Cogitating", "Brewing", "Percolating", "Mulli
          "Noodling", "Crafting", "Reticulating", "Synthesizing", "Considering"]
 CONTINUE_MESSAGES = ["continue", "ok, go on", "looks good, continue", "yes, keep going",
                      "go ahead", "sounds right, continue", "next"]
+HELP_TEXT = """\
+   ⎿  Claude Code
+
+      Always review Claude's responses, especially when running code.
+
+      Interaction modes
+        Esc Esc   interrupt / clear focus
+        Ctrl+O    view transcript
+        Space     skip ahead
+        + / -     adjust output rate
+        Ctrl+T    toggle streaming
+        Shift+Tab cycle permission mode
+
+      Slash commands
+        /clear    clear conversation history
+        /compact  compact conversation
+        /cost     show session cost
+        /help     show this help
+        /resume   resume a previous conversation
+        /exit     exit the REPL"""
 MAX_LOG_WIDGETS = 500
 WPM_STEP = 25
 _WORD_RE = re.compile(r"\S+\s*")
@@ -378,6 +398,18 @@ class MainScreen(BaseScreen):
         self.set_busy(False)
         self.start_player(resumed=True)
 
+    def jump_to(self, pos: tuple[int, int]) -> None:
+        """Continue reading from another position (chosen in /resume)."""
+        self.app.set_position(pos)
+        if self.bossed:
+            self.resume()
+            return
+        self.workers.cancel_group(self, "player")
+        self._drop_pending()
+        self.collapse_novel()
+        self.set_busy(False)
+        self.start_player(resumed=True)
+
     def _drop_pending(self) -> None:
         for future in (self._answer, self._submit):
             if future is not None and not future.done():
@@ -441,7 +473,7 @@ class MainScreen(BaseScreen):
             text = self.typeout.finish()
         prompt.set_buffer("")
         if self.bossed:
-            if text.lower() in ("continue", "/resume", "resume"):
+            if text.lower() in ("continue", "resume"):
                 await self.append(NoteLine(user_text(text)))
                 self.resume()
             elif text.startswith("/"):
@@ -467,6 +499,19 @@ class MainScreen(BaseScreen):
         elif cmd == "/clear":
             log = self.log_view
             await log.remove_children(list(log.children)[1:])
+        elif cmd == "/resume":
+            self.app.open_resume()
+        elif cmd == "/compact":
+            self.run_worker(self.compact(), group="compact")
+        elif cmd == "/help":
+            await self.append(NoteLine(Text(HELP_TEXT, style="dim")))
+        elif cmd == "/cost":
+            tokens = self.app.tokens
+            await self.append(NoteLine(Text(
+                f"   ⎿  Total cost: ${tokens * 9e-6:.2f}\n"
+                f"      Total tokens: {tokens:,}\n"
+                f"      Total code changes: {self.rng.randint(40, 400)} lines added, "
+                f"{self.rng.randint(10, 200)} lines removed", style="dim"), margin=False))
         else:
             await self.append(NoteLine(Text(f"  ⎿  Unknown command: {cmd}", style="dim")))
 

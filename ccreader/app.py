@@ -73,6 +73,22 @@ class ReaderApp(App, inherit_bindings=False):
         chapter, para = self.position
         self.push_screen(TranscriptScreen(self.book, chapter, para, self.config.max_width))
 
+    def open_resume(self) -> None:
+        from ccreader.resume import ResumeScreen
+        from ccreader.sessions import build_sessions
+
+        if isinstance(self.screen, ResumeScreen):
+            return
+        current = self.position[0]
+        sessions = build_sessions(self.book, self.corpus, current)
+        self.push_screen(ResumeScreen(sessions, current), callback=self._resume_chosen)
+
+    def _resume_chosen(self, chapter: int | None) -> None:
+        if chapter is None or self.main is None:
+            return
+        pos = self.position if chapter == self.position[0] else (chapter, 0)
+        self.main.jump_to(self.book.clamp(*pos))
+
     def boss_key(self) -> None:
         """Esc Esc: hide the novel (from any view), or resume when already hidden."""
         if self.transcript_only:

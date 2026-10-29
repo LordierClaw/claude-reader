@@ -165,3 +165,18 @@ async def test_focus_loss_triggers_boss(sample_txt):
         app.post_message(events.AppBlur())
         await pilot.pause(0.1)
         assert app.main.bossed
+
+
+async def test_resume_picker_jumps_to_chapter(sample_txt):
+    app = make_app(sample_txt)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await advance(pilot, 3)
+        await pilot.press(*"/resume", "enter")
+        await pilot.pause(0.1)
+        assert type(app.screen).__name__ == "ResumeScreen"
+        await pilot.press("down", "down", "enter")
+        await pilot.pause(0.1)
+        assert app.screen is app.main
+        assert app.position == (3, 0)
+        await advance(pilot, 6)
+        assert any(b.chapter == 3 for b in visible_novel(app.main))
