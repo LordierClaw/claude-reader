@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from time import monotonic
 
 from rich.text import Text
@@ -33,6 +34,8 @@ VERBS = ["Thinking", "Pondering", "Cogitating", "Brewing", "Percolating", "Mulli
 CONTINUE_MESSAGES = ["continue", "ok, go on", "looks good, continue", "yes, keep going",
                      "go ahead", "sounds right, continue", "next"]
 MAX_LOG_WIDGETS = 500
+WPM_STEP = 25
+_WORD_RE = re.compile(r"\S+\s*")
 
 
 class MainScreen(BaseScreen):
@@ -199,14 +202,56 @@ class MainScreen(BaseScreen):
             self.current_block.set_current(False)
         self.current_block = block
         block.set_current(not event.title)
+        if not event.title and app.stream_mode == "stream":
+            block.revealed = 0
         await self.append(block)
         await self.show_text(block)
-        self.add_tokens(int(len(event.text) / 3.5))
 
     async def show_text(self, block: NovelBlock) -> None:
+        if block.title:
+            block.reveal(len(block.text))
+            await self.wait(0.6)
+            return
+        if self.app.stream_mode == "instant":
+            block.reveal(len(block.text))
+            self.add_tokens(int(len(block.text) / 3.5))
+            words = len(block.text.split())
+            await self.wait(words / self.app.wpm * 60)
+            return
+        await self.stream(block)
+        await self.wait(self.rng.uniform(0.4, 1.0))
+
+    async def stream(self, block: NovelBlock) -> None:
+        """Reveal the paragraph word by word at the reading speed (Space finishes it)."""
+        words = list(_WORD_RE.finditer(block.text))
+        block.reveal(0)
+        self._skip.clear()
+        shown = 0
+        budget = 0.0
+        last = monotonic()
+        rate = 1.0
+        while shown < len(words) and not self._skip.is_set():
+            await asyncio.sleep(1 / 30)
+            now = monotonic()
+            budget += (now - last) * self.app.wpm / 60 * rate
+            last = now
+            n = int(budget)
+            if not n:
+                continue
+            budget -= n
+            start = words[shown].start()
+            shown = min(len(words), shown + n)
+            end = words[shown - 1].end()
+            block.reveal(end)
+            self.add_tokens(max(1, int((end - start) / 3.5)))
+            rate = self.rng.uniform(0.75, 1.3)
+            if block.text[:end].rstrip()[-1:] in ".!?…" and self.rng.random() < 0.25:
+                await self.wait(self.rng.uniform(0.15, 0.5))
+                last = monotonic()
+        if block.revealed < len(block.text):
+            self.add_tokens(int((len(block.text) - block.revealed) / 3.5))
         block.reveal(len(block.text))
-        words = len(block.text.split())
-        await self.wait(words / self.app.wpm * 60 if not block.title else 0.6)
+        self._skip.clear()
 
     # -- user input --------------------------------------------------------
 
@@ -249,6 +294,11 @@ class MainScreen(BaseScreen):
             self.app.open_transcript()
         elif key == "shift+tab":
             self.query_one(StatusBar).cycle()
+        elif key == "ctrl+t":
+            app = self.app
+            app.stream_mode = "instant" if app.stream_mode == "stream" else "stream"
+            self._skip.set()
+            self.flash("output: " + app.stream_mode)
         elif key == "ctrl+c":
             now = monotonic()
             if not prompt.buffer and now - self._ctrl_c < 1.0:
@@ -277,4 +327,22 @@ class MainScreen(BaseScreen):
             if self._submit is not None:
                 self.run_worker(self.submit())
                 return True
+        if char in "+=-_":
+            step = WPM_STEP if char in "+=" else -WPM_STEP
+            self.app.wpm = max(60, min(2000, self.app.wpm + step))
+            self.flash(f"{self.app.wpm}/min")
+            return True
         return False
+
+    def flash(self, text: str) -> None:
+        """Briefly show a value in the status bar."""
+        status = self.query_one(StatusBar)
+        status.flash = text
+        status.refresh()
+
+        def clear() -> None:
+            if status.flash == text:
+                status.flash = ""
+                status.refresh()
+
+        self.set_timer(2.0, clear)

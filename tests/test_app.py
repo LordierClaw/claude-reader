@@ -41,3 +41,32 @@ async def test_transcript_toggle(sample_txt):
         await pilot.press("q")
         await pilot.pause(0.1)
         assert app.screen is app.main
+
+
+async def test_stream_mode_reveals_progressively_and_space_finishes(sample_txt):
+    app = make_app(sample_txt, stream_mode="stream", wpm=300)
+    async with app.run_test(size=(100, 40)) as pilot:
+        screen = app.main
+        partial = None
+        for _ in range(200):
+            await pilot.pause(0.05)
+            blocks = [b for b in screen.query(NovelBlock) if not b.title]
+            if blocks and 0 < blocks[-1].revealed < len(blocks[-1].text):
+                partial = blocks[-1]
+                break
+            if not screen.busy:
+                break
+            # skip thinking / tool waits, but not the stream itself
+            if not blocks:
+                screen._skip.set()
+        assert partial is not None
+        await pilot.press("space")
+        await pilot.pause(0.1)
+        assert partial.fully_revealed
+
+
+async def test_wpm_keys(sample_txt):
+    app = make_app(sample_txt, wpm=250)
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.press("plus", "plus", "minus")
+        assert app.wpm == 275

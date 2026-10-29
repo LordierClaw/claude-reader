@@ -257,6 +257,7 @@ class StatusBar(Static):
         super().__init__()
         self.mode = 0
         self.metrics = ""
+        self.flash = ""
 
     def cycle(self) -> None:
         self.mode = (self.mode + 1) % len(self.MODES)
@@ -273,6 +274,8 @@ class StatusBar(Static):
         left.append(hint, style=NOISE)
         if self.metrics:
             left.append(f" · {self.metrics}", style=NOISE)
+        if self.flash:
+            left.append(f" · {self.flash}", style=NOISE)
         return _line(left)
 
 
